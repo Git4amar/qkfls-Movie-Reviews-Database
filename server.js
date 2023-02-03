@@ -4,7 +4,7 @@ const bodyParser = require('body-parser')
 require('dotenv').config()
 const strings = require("/app/utils/strings.json");
 const { CloudantV1 } = require('@ibm-cloud/cloudant');
-const { BasicAuthenticator } = require('ibm-cloud-sdk-core');
+const { IamAuthenticator } = require('ibm-cloud-sdk-core');
 const uuid = require('uuid');
 
 // parse application/x-www-form-urlencoded
@@ -13,67 +13,69 @@ app.use(bodyParser.urlencoded({ extended: false }))
 // parse application/json
 app.use(bodyParser.json())
 
-let NLU_APIKEY, NLU_URL, CLOUDANT_URL, CLOUDANT_API;
-let moviesDb, naturalLanguageUnderstanding, cloudant;
+//let NLU_APIKEY, NLU_URL, CLOUDANT_URL; //CLOUDANT_API;
+//let moviesDb, naturalLanguageUnderstanding, cloudant;
 const dbName = 'movies-reviews';
-let service;
+//let service;
 
 //load from local .env file
 console.log('local env file found')
-NLU_APIKEY = process.env.NLU_APIKEY;
-NLU_URL = process.env.NLU_URL;
-CLOUDANT_URL = process.env.CLOUDANT_URL;
-CLOUDANT_USERNAME = process.env.CLOUDANT_USERNAME;
-CLOUDANT_PASSWORD = process.env.CLOUDANT_PASSWORD;
+const NLU_APIKEY = process.env.NLU_APIKEY;
+const NLU_URL = process.env.NLU_URL;
+const CLOUDANT_URL = process.env.CLOUDANT_URL;
+//CLOUDANT_USERNAME = process.env.CLOUDANT_USERNAME;
+const CLOUDANT_PASSWORD = process.env.CLOUDANT_PASSWORD;
 
 
-function initDB() {
-  const authenticator = new BasicAuthenticator({
-      username: process.env.CLOUDANT_USERNAME,
-      password: process.env.CLOUDANT_PASSWORD
+function db_service() {
+  const authenticator = new IamAuthenticator({
+    apikey: CLOUDANT_PASSWORD
   });
 
-    service = new CloudantV1({
+  let service = new CloudantV1({
     authenticator: authenticator
-});
+  });
+  service.setServiceUrl(CLOUDANT_URL);
 
-service.setServiceUrl(process.env.CLOUDANT_URL);
+  return service;
 }
 
-if (CLOUDANT_USERNAME && CLOUDANT_PASSWORD && CLOUDANT_URL) {
-  initDB();
-  // Create a new "moviesDb" database.
-
-  service.getAllDbs().then(response => {
-    if(!response.result.includes(dbName)) {
-      console.log(dbName+" doesn't exist. Creating it.");
-    service.putDatabase({
-        db: dbName,
-        partitioned: true
-      }).then(response => {
-        console.log(response.result);
-      });    
-    }
-  });
-} 
-
-if (NLU_APIKEY && NLU_URL) {
+function nlu_service() {
   const NaturalLanguageUnderstandingV1 = require('ibm-watson/natural-language-understanding/v1');
   const { IamAuthenticator } = require('ibm-watson/auth');
 
-  naturalLanguageUnderstanding = new NaturalLanguageUnderstandingV1({
+  let naturalLanguageUnderstanding = new NaturalLanguageUnderstandingV1({
     version: '2020-08-01',
     authenticator: new IamAuthenticator({
       apikey: NLU_APIKEY,
     }),
     serviceUrl: NLU_URL,
   });
-}
+  return naturalLanguageUnderstanding;
+};
+
+if (CLOUDANT_PASSWORD && CLOUDANT_URL) {
+  let service = db_service();
+  // Create a new "moviesDb" database.
+  service.getAllDbs().then(response => {
+    if (!response.result.includes(dbName)) {
+      console.log(dbName + " doesn't exist. Creating it.");
+      service.putDatabase({
+        db: dbName,
+        partitioned: true
+      }).then(response => {
+        console.log(response.result);
+      });
+    }
+  });
+};
 
 // user asked for the index page
 app.get('/', function (req, res, next) {
   // show error if nlu or cloudant credentials are not present
-  errors = checkServiceCredentials();
+  let service = db_service();
+  let naturalLanguageUnderstanding = nlu_service();
+  let errors = checkServiceCredentials(service, naturalLanguageUnderstanding);
   if (errors && errors.length > 0) {
     res.render('index.ejs', { msg: { errors: errors } });
   } else {
@@ -84,7 +86,9 @@ app.get('/', function (req, res, next) {
 // user is on the reviews page
 app.get("/reviews", function (request, response) {
   // get all the cloudant data and display the result
-  let errors = checkServiceCredentials();
+  let service = db_service();
+  let naturalLanguageUnderstanding = nlu_service();
+  let errors = checkServiceCredentials(service, naturalLanguageUnderstanding);
   if (errors && errors.length > 0) {
     response.render('reviews.ejs', { msg: { errors: errors } })
   } else {
@@ -93,8 +97,8 @@ app.get("/reviews", function (request, response) {
       includeDocs: true,
       limit: 10
     }).then(res => {
-        response.render('reviews.ejs', { msg: { result: res.result.rows } });
-    }).catch((err)=>{
+      response.render('reviews.ejs', { msg: { result: res.result.rows } });
+    }).catch((err) => {
       response.render('reviews.ejs', { msg: { errors: [strings.CLOUDANT_ERROR + " " + err.message] } })
     });
   }
@@ -103,7 +107,9 @@ app.get("/reviews", function (request, response) {
 // user posted a review
 app.post("/reviews", function (request, response) {
 
-  let errors = checkServiceCredentials();
+  let service = db_service();
+  let naturalLanguageUnderstanding = nlu_service();
+  let errors = checkServiceCredentials(service, naturalLanguageUnderstanding);
 
   let firstName = request.body.first_name;
   let lastName = request.body.last_name;
@@ -118,51 +124,48 @@ app.post("/reviews", function (request, response) {
     response.render('reviews.ejs', { msg: { errors: errors } })
   } else {
 
-    let doc = {
-      "firstName": firstName,
-      "lastName": lastName,
-      "movie": movie,
-      "review": review
-    };
-
-    const analyzeParams = {
-      'text': review,
-      'features': {
-        'sentiment': {
-        }
-      },
-    };
-
-    naturalLanguageUnderstanding.analyze(analyzeParams)
-      .then(analysisResults => {
-        console.log(JSON.stringify(analysisResults, null, 2));
-
-        doc['sentiment'] = analysisResults.result.sentiment.document.label;
-        doc['_id'] = uuid.v4()+":1",
-        service.postDocument({
-          db: dbName,
-          document: doc
-        }).then(response => {
-          console.log(response.result);
-        });
+  let doc = {
+    "firstName": firstName,
+    "lastName": lastName,
+    "movie": movie,
+    "review": review
+  };
+  const analyzeParams = {
+    'text': review,
+    'features': {
+      'sentiment': {
+      }
+    },
+  };
+  naturalLanguageUnderstanding.analyze(analyzeParams)
+    .then(analysisResults => {
+      console.log(JSON.stringify(analysisResults, null, 2));
+      doc['sentiment'] = analysisResults.result.sentiment.document.label;
+      doc['_id'] = uuid.v4() + ":1",
+      service.postDocument({
+        db: dbName,
+        document: doc
+      }).then(res => {
+        console.log(res.result);
         response.redirect('/reviews');
-      })
-      .catch(err => {
-        console.log('error:', err);
-        response.render('reviews.ejs', { msg: { errors: [strings.NLU_NOT_ENOUGH_TEXT] } })
       });
+    })
+    .catch(err => {
+      console.log('error:', err);
+      response.render('reviews.ejs', { msg: { errors: [strings.NLU_NOT_ENOUGH_TEXT] } })
+    });
   }
 });
 
-function checkServiceCredentials() {
+function checkServiceCredentials(service, naturalLanguageUnderstanding) {
   let errors = [];
-    if (!service) {
-      errors.push(strings.CLOUDANT_PROBLEM);
-    }
+  if (!service) {
+    errors.push(strings.CLOUDANT_PROBLEM);
+  }
 
-    if (!naturalLanguageUnderstanding) {
-      errors.push(strings.NLU_PROBLEM);
-    }
+  if (!naturalLanguageUnderstanding) {
+    errors.push(strings.NLU_PROBLEM);
+  }
   return errors;
 }
 
